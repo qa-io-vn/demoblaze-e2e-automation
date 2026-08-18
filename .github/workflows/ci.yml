@@ -1,0 +1,175 @@
+name: E2E Demo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Formatting
+        run: npm run format:check
+
+  demo:
+    name: Demo on ${{ matrix.project }}
+    runs-on: ubuntu-latest
+    needs: static-analysis
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [chromium, firefox, webkit]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Cache browser binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install browsers
+        run: npx playwright install --with-deps ${{ matrix.project }}
+
+      - name: Run the demo
+        run: npx playwright test --project=${{ matrix.project }}
+        env:
+          TEST_USERNAME: ${{ secrets.TEST_USERNAME }}
+          TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report-${{ matrix.project }}
+          path: playwright-report
+          retention-days: 7
+
+      - name: Upload Allure results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: allure-results-${{ matrix.project }}
+          path: allure-results
+          retention-days: 7
+
+      - name: Upload failure artefacts
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failure-artefacts-${{ matrix.project }}
+          path: test-results
+          retention-days: 7
+
+  allure-report:
+    name: Allure report
+    runs-on: ubuntu-latest
+    needs: demo
+    if: ${{ !cancelled() }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - run: npm ci
+
+      - name: Collect Allure results from every browser
+        uses: actions/download-artifact@v4
+        with:
+          path: allure-results
+          pattern: allure-results-*
+          merge-multiple: true
+
+      - name: Keep the history from the last published report
+        continue-on-error: true
+        run: |
+          curl -sfL https://qa-io-vn.github.io/demoblaze-e2e-automation/history/history.json \
+            -o history.json && mkdir -p allure-results/history \
+            && mv history.json allure-results/history/history.json
+
+      - name: Generate the Allure report
+        run: npm run allure:generate
+
+      - name: Upload the Allure report
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: allure-report
+          retention-days: 14
+
+      - name: Configure Pages
+        id: pages
+        continue-on-error: true
+        uses: actions/configure-pages@v5
+
+      - name: Upload to Pages
+        if: steps.pages.outcome == 'success'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: allure-report
+
+      - name: Publish to Pages
+        id: deploy
+        if: steps.pages.outcome == 'success'
+        uses: actions/deploy-pages@v4
+
+      - name: Summary
+        run: |
+          {
+            echo "### Allure report"
+            echo ""
+            if [ -n "${{ steps.deploy.outputs.page_url }}" ]; then
+              echo "Published: ${{ steps.deploy.outputs.page_url }}"
+            else
+              echo "Download the \`allure-report\` artefact and open \`index.html\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
